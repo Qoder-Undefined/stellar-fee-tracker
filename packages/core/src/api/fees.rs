@@ -18,6 +18,7 @@ use crate::cache::ResponseCache;
 use crate::congestion::wait_advisory::{compute_wait_advisory, WaitAdvisory};
 use crate::error::AppError;
 use crate::insights::{FeeDataPoint, FeeInsightsEngine, TrendIndicator, TrendStrength};
+use crate::repository::FeeRepository;
 use crate::services::horizon::HorizonClient;
 use crate::store::FeeHistoryStore;
 
@@ -62,6 +63,8 @@ pub struct FeesApiState {
     pub fee_store: Arc<RwLock<FeeHistoryStore>>,
     pub insights_engine: Option<Arc<RwLock<FeeInsightsEngine>>>,
     pub horizon_client: Option<Arc<HorizonClient>>,
+    /// Used by `/fees/wait-advisory` to read the latest `fee_stats_snapshots` row.
+    pub repository: Option<Arc<FeeRepository>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -248,7 +251,22 @@ pub async fn fee_history(
             Json(json!({ "error": format!("Failed to serialize fee history: {}", err) })),
         )
     })?;
-    let etag = compute_etag(&body);
+    // `from`/`to` come from `Utc::now()` and change on every request, so they
+    // must not feed the ETag or `If-None-Match` could never match. Hash only
+    // the stable parts of the payload.
+    let etag_source = serde_json::to_vec(&(
+        &payload.window,
+        payload.data_points,
+        &payload.fees,
+        &payload.summary,
+    ))
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to serialize fee history: {}", err) })),
+        )
+    })?;
+    let etag = compute_etag(&etag_source);
     let last_modified_value = resolve_last_modified(&state).await;
 
     if if_none_match_matches(&request_headers, &etag) {
@@ -517,7 +535,10 @@ pub async fn transaction_fee_lookup(
             ledger_sequence: p.ledger_sequence,
             timestamp: p.timestamp,
         })),
-        None => Err(AppError::NotFound(format!("Transaction not found: {}", hash))),
+        None => Err(AppError::NotFound(format!(
+            "Transaction not found: {}",
+            hash
+        ))),
     }
 }
 
@@ -529,6 +550,9 @@ const MAX_WAIT_WINDOW_SECS: u64 = 7 * 86_400;
 
 /// Recent window for current fee sampling (5 minutes).
 const RECENT_WINDOW_MINS: i64 = 5;
+
+/// How far back to look for the latest fee_stats snapshot (15 minutes).
+const CAPACITY_SNAPSHOT_WINDOW_MINS: i64 = 15;
 
 /// Spike detection window (1 hour).
 #[allow(dead_code)]
@@ -584,9 +608,22 @@ pub async fn wait_advisory(
         None => 0,
     };
 
-    // Get capacity usage from insights if available (placeholder — Horizon doesn't
-    // always expose this; we'll use None until the adapter is wired).
-    let capacity_usage: Option<f64> = None;
+    // Ledger capacity usage comes from the latest persisted fee_stats snapshot
+    // (written by the fee-stats poller); None when there is no repository or data yet.
+    let capacity_usage: Option<f64> = match &state.repository {
+        Some(repo) => match repo
+            .fetch_fee_snapshots_since(now - Duration::minutes(CAPACITY_SNAPSHOT_WINDOW_MINS))
+            .await
+        {
+            // Snapshots are ordered by ledger ascending, so the last one is the latest.
+            Ok(snapshots) => snapshots.last().and_then(|s| s.ledger_capacity_usage),
+            Err(err) => {
+                tracing::warn!("Failed to read fee_stats snapshots for wait-advisory: {}", err);
+                None
+            }
+        },
+        None => None,
+    };
 
     let advisory = compute_wait_advisory(
         &recent_fees,
@@ -667,6 +704,7 @@ mod tests {
             fee_store: Arc::new(RwLock::new(store)),
             insights_engine: None,
             horizon_client: None,
+            repository: None,
         })
     }
 
@@ -677,6 +715,7 @@ mod tests {
             fee_store: Arc::new(RwLock::new(FeeHistoryStore::new(100))),
             insights_engine: Some(Arc::new(RwLock::new(engine))),
             horizon_client: None,
+            repository: None,
         })
     }
 
@@ -690,6 +729,7 @@ mod tests {
             fee_store: Arc::new(RwLock::new(FeeHistoryStore::new(100))),
             insights_engine: None,
             horizon_client: None,
+            repository: None,
         })
     }
 

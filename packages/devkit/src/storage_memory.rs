@@ -19,6 +19,9 @@ impl Storage for MemoryStorage {
             .filter(|r| params.from_ledger.map_or(true, |f| r.ledger >= f))
             .filter(|r| params.to_ledger.map_or(true, |t| r.ledger <= t))
             .cloned()
+            .filter(|r| params.from_ledger.is_none_or(|f| r.ledger >= f))
+            .filter(|r| params.to_ledger.is_none_or(|t| r.ledger <= t))
+            .map(|r| FeeRecordLike { ledger: r.ledger, fee_charged: r.fee_charged })
             .take(params.limit.unwrap_or(usize::MAX))
             .collect()
     }

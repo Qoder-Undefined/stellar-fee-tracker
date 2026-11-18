@@ -1,22 +1,3 @@
-mod alerts;
-mod analytics;
-mod api;
-mod cache;
-mod cli;
-mod config;
-mod congestion;
-mod db;
-mod error;
-mod insights;
-mod logging;
-mod metrics;
-mod middleware;
-mod recommendation;
-mod repository;
-mod scheduler;
-mod services;
-mod store;
-
 use std::sync::Arc;
 
 use axum::http::{HeaderName, Method};
@@ -27,19 +8,21 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::alerts::AlertManager;
-use crate::cache::ResponseCache;
-use crate::cli::Cli;
-use crate::config::Config;
-use crate::error::AppError;
-use crate::insights::{FeeInsightsEngine, HorizonFeeDataProvider, InsightsConfig};
-use crate::logging::init_logging;
-use crate::metrics::AppMetrics;
-use crate::middleware::rate_limit::{enforce_rate_limit, RateLimitState};
-use crate::repository::FeeRepository;
-use crate::scheduler::{run_fee_polling_with_retry, run_fee_stats_polling};
-use crate::services::horizon::HorizonClient;
-use crate::store::{FeeHistoryStore, DEFAULT_CAPACITY};
+use stellar_fee_tracker::alerts::AlertManager;
+use stellar_fee_tracker::api;
+use stellar_fee_tracker::cache::ResponseCache;
+use stellar_fee_tracker::cli::Cli;
+use stellar_fee_tracker::config::Config;
+use stellar_fee_tracker::db;
+use stellar_fee_tracker::error::AppError;
+use stellar_fee_tracker::insights::{FeeInsightsEngine, HorizonFeeDataProvider, InsightsConfig};
+use stellar_fee_tracker::logging::init_logging;
+use stellar_fee_tracker::metrics::AppMetrics;
+use stellar_fee_tracker::middleware::rate_limit::{enforce_rate_limit, RateLimitState};
+use stellar_fee_tracker::repository::FeeRepository;
+use stellar_fee_tracker::scheduler::{run_fee_polling_with_retry, run_fee_stats_polling};
+use stellar_fee_tracker::services::horizon::HorizonClient;
+use stellar_fee_tracker::store::{FeeHistoryStore, DEFAULT_CAPACITY};
 
 #[tokio::main]
 async fn main() {
@@ -101,9 +84,14 @@ async fn main() {
 
     let fee_store = Arc::new(RwLock::new(FeeHistoryStore::new(DEFAULT_CAPACITY)));
 
-    let insights_engine = Arc::new(RwLock::new(FeeInsightsEngine::new(
-        InsightsConfig::default(),
-    )));
+    let mut insights_config = InsightsConfig::default();
+    if let Some(interval) = i64::try_from(config.poll_interval_seconds)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+    {
+        insights_config.polling_interval = interval;
+    }
+    let insights_engine = Arc::new(RwLock::new(FeeInsightsEngine::new(insights_config)));
     let current_fees_cache = Arc::new(Mutex::new(ResponseCache::new(Duration::from_secs(
         config.cache_ttl_seconds,
     ))));
@@ -152,9 +140,11 @@ async fn main() {
 
     // ---- CORS policy ----
     // Log and skip invalid origins rather than panicking at startup.
+    let allow_any_origin = config.allowed_origins.iter().any(|o| o == "*");
     let origins: Vec<axum::http::HeaderValue> = config
         .allowed_origins
         .iter()
+        .filter(|o| o.as_str() != "*")
         .filter_map(|o| match o.parse() {
             Ok(v) => Some(v),
             Err(err) => {
@@ -164,8 +154,18 @@ async fn main() {
         })
         .collect();
 
+    if !allow_any_origin && origins.is_empty() {
+        tracing::warn!("No valid ALLOWED_ORIGINS configured; all cross-origin requests will be blocked");
+    }
+
+    let allow_origin = if allow_any_origin {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::list(origins)
+    };
+
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(allow_origin)
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -192,9 +192,9 @@ async fn main() {
     //
     // Route tiers (from least to most restricted):
     //
-    //  /health   \u2014 no rate limit, no auth (must always respond for load-balancer probes)
-    //  /metrics  \u2014 rate limited, NO API-key auth (must be scrapeable by Prometheus agents)
-    //  all else  \u2014 rate limited + optional API-key auth
+    //  /health   - no rate limit, no auth (must always respond for load-balancer probes)
+    //  /metrics  - rate limited, NO API-key auth (must be scrapeable by Prometheus agents)
+    //  all else  - rate limited + optional API-key auth
     //
     // fees routes get shared state (Horizon client, store, insights engine)
     // insights routes get Arc<RwLock<FeeInsightsEngine>> as their own state
@@ -214,38 +214,9 @@ async fn main() {
 
     // /metrics: rate limited but NOT behind API-key auth (Prometheus scrapers
     // should not need to know the API key).
-    let metrics_for_handler = app_metrics.clone();
-    let metrics_route = Router::new().route(
-        "/metrics",
-        get(move || {
-            let m = metrics_for_handler.clone();
-            async move {
-                match m.render() {
-                    Ok(body) => axum::response::Response::builder()
-                        .status(200)
-                        .header(
-                            axum::http::header::CONTENT_TYPE,
-                            "text/plain; version=0.0.4",
-                        )
-                        .body(axum::body::Body::from(body))
-                        .unwrap_or_else(|_| {
-                            axum::response::Response::new(axum::body::Body::from(
-                                "internal error",
-                            ))
-                        }),
-                    Err(err) => {
-                        tracing::error!("Failed to render metrics: {}", err);
-                        axum::response::Response::builder()
-                            .status(500)
-                            .body(axum::body::Body::from("metrics error"))
-                            .unwrap_or_else(|_| {
-                                axum::response::Response::new(axum::body::Body::empty())
-                            })
-                    }
-                }
-            }
-        }),
-    );
+    let metrics_route = Router::new()
+        .route("/metrics", get(api::metrics::metrics_handler))
+        .with_state(app_metrics.clone());
 
     // Rate-limited tier: metrics + business API routes.
     let rate_limited = Router::new().merge(metrics_route).merge(api_routes).layer(
@@ -276,6 +247,7 @@ async fn main() {
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
+            .with_graceful_shutdown(crate::scheduler::shutdown_signal())
             .await
             .unwrap_or_else(|err| tracing::error!("Server error: {}", err));
         },

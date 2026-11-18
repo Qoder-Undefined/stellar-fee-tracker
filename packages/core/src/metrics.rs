@@ -1,11 +1,11 @@
 //! Prometheus metrics registry for the Stellar fee tracker.
 //!
-//! [] owns all registered metrics and the [] they
-//! belong to. Construct it once at startup, wrap in , and pass it
+//! [`AppMetrics`] owns all registered metrics and the [`Registry`] they
+//! belong to. Construct it once at startup, wrap in [`std::sync::Arc`], and pass it
 //! to the scheduler and HTTP middleware.
 //!
-//! Exposed at  in Prometheus text exposition format
-//! (). The endpoint is intentionally excluded
+//! Exposed at `GET /metrics` in Prometheus text exposition format
+//! ([`prometheus::TextEncoder`]). The endpoint is intentionally excluded
 //! from API-key auth so it can be scraped by Prometheus / Grafana agents.
 
 use prometheus::{Counter, Gauge, Opts, Registry};
@@ -20,6 +20,11 @@ pub struct AppMetrics {
     pub polls_total: Counter,
     /// Total number of failed Horizon polling attempts.
     pub poll_errors_total: Counter,
+    /// Total `/fee_stats` polling attempts (separate from `polls_total`, which
+    /// counts the transaction poller, so the two loops are distinguishable).
+    pub fee_stats_polls_total: Counter,
+    /// Total failed `/fee_stats` polling attempts.
+    pub fee_stats_poll_errors_total: Counter,
     /// Current number of fee data points held in the in-memory store.
     pub fee_points_stored: Gauge,
     /// Latest short-term rolling average fee (in stroops).
@@ -50,6 +55,16 @@ impl AppMetrics {
             "Failed Horizon polling attempts",
         ))?;
 
+        let fee_stats_polls_total = Counter::with_opts(Opts::new(
+            "stellar_fee_tracker_fee_stats_polls_total",
+            "Total Horizon /fee_stats polling attempts",
+        ))?;
+
+        let fee_stats_poll_errors_total = Counter::with_opts(Opts::new(
+            "stellar_fee_tracker_fee_stats_poll_errors_total",
+            "Failed Horizon /fee_stats polling attempts",
+        ))?;
+
         let fee_points_stored = Gauge::with_opts(Opts::new(
             "stellar_fee_tracker_fee_points_stored",
             "Current size of the FeeHistoryStore",
@@ -77,6 +92,8 @@ impl AppMetrics {
 
         registry.register(Box::new(polls_total.clone()))?;
         registry.register(Box::new(poll_errors_total.clone()))?;
+        registry.register(Box::new(fee_stats_polls_total.clone()))?;
+        registry.register(Box::new(fee_stats_poll_errors_total.clone()))?;
         registry.register(Box::new(fee_points_stored.clone()))?;
         registry.register(Box::new(current_avg_fee.clone()))?;
         registry.register(Box::new(spikes_detected_total.clone()))?;
@@ -86,6 +103,8 @@ impl AppMetrics {
         Ok(Self {
             polls_total,
             poll_errors_total,
+            fee_stats_polls_total,
+            fee_stats_poll_errors_total,
             fee_points_stored,
             current_avg_fee,
             spikes_detected_total,
@@ -153,7 +172,6 @@ mod integration_tests {
     use axum::{
         body::Body,
         http::{Method, Request},
-        response::Response,
         routing::get,
         Router,
     };
@@ -162,25 +180,9 @@ mod integration_tests {
 
     async fn make_metrics_app() -> (Router, Arc<AppMetrics>) {
         let metrics = Arc::new(AppMetrics::new().unwrap());
-        let m = metrics.clone();
         let app = Router::new().route(
             "/metrics",
-            get(move || {
-                let m2 = m.clone();
-                async move {
-                    match m2.render() {
-                        Ok(body) => Response::builder()
-                            .status(200)
-                            .header("content-type", "text/plain; version=0.0.4")
-                            .body(Body::from(body))
-                            .unwrap(),
-                        Err(_) => Response::builder()
-                            .status(500)
-                            .body(Body::from("error"))
-                            .unwrap(),
-                    }
-                }
-            }),
+            get(crate::api::metrics::metrics_handler).with_state(metrics.clone()),
         );
         (app, metrics)
     }

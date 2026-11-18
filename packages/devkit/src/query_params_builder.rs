@@ -1,10 +1,5 @@
 //! Builder for constructing storage query parameters.
-#[derive(Default, Clone, Debug)]
-pub struct QueryParams {
-    pub from_ledger: Option<u32>,
-    pub to_ledger: Option<u32>,
-    pub limit: Option<usize>,
-}
+use crate::storage::QueryParams;
 
 #[derive(Default)]
 pub struct QueryParamsBuilder(QueryParams);

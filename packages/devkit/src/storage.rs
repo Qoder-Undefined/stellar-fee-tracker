@@ -1,10 +1,7 @@
 //! Storage trait: persistence abstraction for fee records.
-pub struct FeeRecordLike {
-    pub ledger: u32,
-    pub fee_charged: i64,
-}
+use crate::types::FeeRecord;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct QueryParams {
     pub from_ledger: Option<u32>,
     pub to_ledger: Option<u32>,
@@ -12,6 +9,6 @@ pub struct QueryParams {
 }
 
 pub trait Storage {
-    fn insert(&mut self, record: FeeRecordLike) -> Result<(), String>;
-    fn query(&self, params: QueryParams) -> Vec<FeeRecordLike>;
+    fn insert(&mut self, record: FeeRecord) -> Result<(), String>;
+    fn query(&self, params: QueryParams) -> Vec<FeeRecord>;
 }
